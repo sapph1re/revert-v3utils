@@ -62,7 +62,7 @@ contract AutoExit is Automator {
     /// @notice params for execute()
     struct ExecuteParams {
         uint256 tokenId; // tokenid to process
-        bytes swapData; // if its a swap order - must include swap data
+        bytes swapData; // if its a swap order - may include swap data for a complex route
         uint256 amountRemoveMin0; // min amount to be removed from liquidity
         uint256 amountRemoveMin1; // min amount to be removed from liquidity
         uint256 deadline; // for uniswap operations
@@ -142,10 +142,6 @@ contract AutoExit is Automator {
 
         // swap to other token
         if (state.isSwap) {
-            if (params.swapData.length == 0) {
-                revert MissingSwapData();
-            }
-
             // reward is taken before swap - if from fees only
             if (config.onlyFees) {
                 state.amount0 -= state.feeAmount0 * params.rewardX64 / Q64;
@@ -168,15 +164,31 @@ contract AutoExit is Automator {
                     state.isAbove ? config.token1SlippageX64 : config.token0SlippageX64
                 );
 
-                (state.amountInDelta, state.amountOutDelta) = _routerSwap(
-                    Swapper.RouterSwapParams(
-                        state.isAbove ? IERC20(state.token1) : IERC20(state.token0),
-                        state.isAbove ? IERC20(state.token0) : IERC20(state.token1),
-                        state.swapAmount,
-                        state.amountOutMin,
-                        params.swapData
-                    )
-                );
+                if (params.swapData.length == 0) {
+                    // simple swap through the same pool
+                    (state.amountInDelta, state.amountOutDelta) = _poolSwap(
+                        Swapper.PoolSwapParams(
+                            IUniswapV3Pool(_getPool(state.token0, state.token1, state.fee)),
+                            IERC20(state.token0),
+                            IERC20(state.token1),
+                            state.fee,
+                            !state.isAbove,
+                            state.swapAmount,
+                            state.amountOutMin
+                        )
+                    );
+                } else {
+                    // swap through the provided route
+                    (state.amountInDelta, state.amountOutDelta) = _routerSwap(
+                        Swapper.RouterSwapParams(
+                            state.isAbove ? IERC20(state.token1) : IERC20(state.token0),
+                            state.isAbove ? IERC20(state.token0) : IERC20(state.token1),
+                            state.swapAmount,
+                            state.amountOutMin,
+                            params.swapData
+                        )
+                    );
+                }
 
                 state.amount0 =
                     state.isAbove ? state.amount0 + state.amountOutDelta : state.amount0 - state.amountInDelta;
