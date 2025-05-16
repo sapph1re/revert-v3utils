@@ -15,13 +15,15 @@ contract AutoExit is Automator {
         uint256 amountReturned0,
         uint256 amountReturned1,
         address token0,
-        address token1
+        address token1,
+        address swappedToToken
     );
     event PositionConfigured(
         uint256 indexed tokenId,
         bool isActive,
         bool token0Swap,
         bool token1Swap,
+        address swapAlwaysToToken,
         int24 token0TriggerTick,
         int24 token1TriggerTick,
         uint64 token0SlippageX64,
@@ -49,6 +51,8 @@ contract AutoExit is Automator {
         // when should action be triggered (when this tick is reached - allow execute)
         int24 token0TriggerTick; // when tick is below this one
         int24 token1TriggerTick; // when tick is equal or above this one
+        // swap always to this token, if it is not zero
+        address swapAlwaysToToken;
         // max price difference from current pool price for swap / Q64
         uint64 token0SlippageX64; // when token 0 is swapped to token 1
         uint64 token1SlippageX64; // when token 1 is swapped to token 0
@@ -89,6 +93,7 @@ contract AutoExit is Automator {
         uint256 swapAmount;
         int24 tick;
         bool isSwap;
+        bool swap0For1;
         bool isAbove;
         address owner;
     }
@@ -133,7 +138,16 @@ contract AutoExit is Automator {
         }
 
         state.isAbove = state.tick >= config.token1TriggerTick;
-        state.isSwap = !state.isAbove && config.token0Swap || state.isAbove && config.token1Swap;
+        if (config.swapAlwaysToToken != address(0)) {
+            if (config.swapAlwaysToToken != state.token0 && config.swapAlwaysToToken != state.token1) {
+                revert InvalidConfig();
+            }
+            state.isSwap = true;
+            state.swap0For1 = config.swapAlwaysToToken == state.token1;
+        } else {
+            state.isSwap = !state.isAbove && config.token0Swap || state.isAbove && config.token1Swap;
+            state.swap0For1 = state.isSwap && !state.isAbove;
+        }
 
         // decrease full liquidity for given position - and return fees as well
         (state.amount0, state.amount1, state.feeAmount0, state.feeAmount1) = _decreaseFullLiquidityAndCollect(
@@ -148,20 +162,20 @@ contract AutoExit is Automator {
                 state.amount1 -= state.feeAmount1 * params.rewardX64 / Q64;
             }
 
-            state.swapAmount = state.isAbove ? state.amount1 : state.amount0;
+            state.swapAmount = state.swap0For1 ? state.amount0 : state.amount1;
             if (state.swapAmount != 0) {
                 (state.sqrtPriceX96, state.currentTick,,,,,) = state.pool.slot0();
 
                 // checks if price in valid oracle range and calculates amountOutMin
                 state.amountOutMin = _validateSwap(
-                    !state.isAbove,
+                    state.swap0For1,
                     state.swapAmount,
                     state.pool,
                     state.currentTick,
                     state.sqrtPriceX96,
                     TWAPSeconds,
                     maxTWAPTickDifference,
-                    state.isAbove ? config.token1SlippageX64 : config.token0SlippageX64
+                    state.swap0For1 ? config.token0SlippageX64 : config.token1SlippageX64
                 );
 
                 if (params.swapData.length == 0) {
@@ -172,7 +186,7 @@ contract AutoExit is Automator {
                             IERC20(state.token0),
                             IERC20(state.token1),
                             state.fee,
-                            !state.isAbove,
+                            state.swap0For1,
                             state.swapAmount,
                             state.amountOutMin
                         )
@@ -181,8 +195,8 @@ contract AutoExit is Automator {
                     // swap through the provided route
                     (state.amountInDelta, state.amountOutDelta) = _routerSwap(
                         Swapper.RouterSwapParams(
-                            state.isAbove ? IERC20(state.token1) : IERC20(state.token0),
-                            state.isAbove ? IERC20(state.token0) : IERC20(state.token1),
+                            state.swap0For1 ? IERC20(state.token0) : IERC20(state.token1),
+                            state.swap0For1 ? IERC20(state.token1) : IERC20(state.token0),
                             state.swapAmount,
                             state.amountOutMin,
                             params.swapData
@@ -191,9 +205,9 @@ contract AutoExit is Automator {
                 }
 
                 state.amount0 =
-                    state.isAbove ? state.amount0 + state.amountOutDelta : state.amount0 - state.amountInDelta;
+                    state.swap0For1 ? state.amount0 - state.amountOutDelta : state.amount0 + state.amountInDelta;
                 state.amount1 =
-                    state.isAbove ? state.amount1 - state.amountInDelta : state.amount1 + state.amountOutDelta;
+                    state.swap0For1 ? state.amount1 + state.amountInDelta : state.amount1 - state.amountOutDelta;
             }
 
             // when swap and !onlyFees - protocol reward is removed only from target token (to incentivize optimal swap done by operator)
@@ -220,11 +234,18 @@ contract AutoExit is Automator {
 
         // delete config for position
         delete positionConfigs[params.tokenId];
-        emit PositionConfigured(params.tokenId, false, false, false, 0, 0, 0, 0, false, 0);
+        emit PositionConfigured(params.tokenId, false, false, false, address(0), 0, 0, 0, 0, false, 0);
 
         // log event
         emit Executed(
-            params.tokenId, msg.sender, state.isSwap, state.amount0, state.amount1, state.token0, state.token1
+            params.tokenId,
+            msg.sender,
+            state.isSwap,
+            state.amount0,
+            state.amount1,
+            state.token0,
+            state.token1,
+            state.swap0For1 ? state.token1 : state.token0
         );
     }
 
@@ -234,6 +255,14 @@ contract AutoExit is Automator {
         if (config.isActive) {
             if (config.token0TriggerTick >= config.token1TriggerTick) {
                 revert InvalidConfig();
+            }
+            address token0;
+            address token1;
+            (,, token0, token1,,,,,,,,) = nonfungiblePositionManager.positions(tokenId);
+            if (config.swapAlwaysToToken != address(0)) {
+                if (config.swapAlwaysToToken != token0 && config.swapAlwaysToToken != token1) {
+                    revert InvalidConfig();
+                }
             }
         }
 
@@ -249,6 +278,7 @@ contract AutoExit is Automator {
             config.isActive,
             config.token0Swap,
             config.token1Swap,
+            config.swapAlwaysToToken,
             config.token0TriggerTick,
             config.token1TriggerTick,
             config.token0SlippageX64,
