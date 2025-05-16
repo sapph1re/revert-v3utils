@@ -204,18 +204,24 @@ contract AutoExit is Automator {
                     );
                 }
 
-                state.amount0 =
-                    state.swap0For1 ? state.amount0 - state.amountOutDelta : state.amount0 + state.amountInDelta;
-                state.amount1 =
-                    state.swap0For1 ? state.amount1 + state.amountInDelta : state.amount1 - state.amountOutDelta;
+                if (state.swap0For1) { // Swapping token0 for token1
+                    // token0 is input (amountInDelta), token1 is output (amountOutDelta)
+                    state.amount0 = state.amount0 - state.amountInDelta;
+                    state.amount1 = state.amount1 + state.amountOutDelta;
+                } else { // Swapping token1 for token0
+                    // token1 is input (amountInDelta), token0 is output (amountOutDelta)
+                    state.amount0 = state.amount0 + state.amountOutDelta;
+                    state.amount1 = state.amount1 - state.amountInDelta;
+                }
             }
 
             // when swap and !onlyFees - protocol reward is removed only from target token (to incentivize optimal swap done by operator)
             if (!config.onlyFees) {
-                if (state.isAbove) {
-                    state.amount0 -= state.amount0 * params.rewardX64 / Q64;
-                } else {
+                // Reward is taken from the token that was received from the swap
+                if (state.swap0For1) { // Swapped to token1 (token1 was received)
                     state.amount1 -= state.amount1 * params.rewardX64 / Q64;
+                } else { // Swapped to token0 (token0 was received)
+                    state.amount0 -= state.amount0 * params.rewardX64 / Q64;
                 }
             }
         } else {
